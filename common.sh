@@ -40,8 +40,10 @@ build_kernel()
 
 		if [ "${V}" = "guest" ]; then
 			BRANCH="${KERNEL_GUEST_BRANCH}"
+			GIT_COMMIT="${KERNEL_GUEST_COMMIT}"
 		else
 			BRANCH="${KERNEL_HOST_BRANCH}"
+			GIT_COMMIT="${KERNEL_HOST_COMMIT}"
 		fi
 
 		# If ${KERNEL_GIT_URL} is ever changed, 'current' remote will be out
@@ -68,7 +70,8 @@ build_kernel()
 
 		pushd ${V} >/dev/null
 			run_cmd git fetch current
-			run_cmd git checkout current/${BRANCH}
+			# run_cmd git checkout current/${BRANCH}
+			run_cmd git checkout ${GIT_COMMIT}
 			COMMIT=$(git log --format="%h" -1 HEAD)
 
 			run_cmd "cp /boot/config-$(uname -r) .config"
@@ -175,7 +178,9 @@ build_install_ovmf()
 
 	pushd ovmf >/dev/null
 		run_cmd git fetch current
-		run_cmd git checkout current/${OVMF_BRANCH}
+		# run_cmd git checkout current/${OVMF_BRANCH}
+		run_cmd git checkout ${OVMF_COMMIT}
+		run_cmd git apply ${OVMF_PATCH}
 		run_cmd git submodule update --init --recursive
 		run_cmd make -C BaseTools
 		. ./edksetup.sh --reconfig
@@ -214,7 +219,8 @@ build_install_qemu()
 
 	pushd qemu >/dev/null
 		run_cmd git fetch current
-		run_cmd git checkout current/${QEMU_BRANCH}
+		# run_cmd git checkout current/${QEMU_BRANCH}
+		run_cmd git checkout ${QEMU_COMMIT}
 		run_cmd ./configure --target-list=x86_64-softmmu --prefix=$DEST
 		run_cmd $MAKE
 		run_cmd $MAKE install
