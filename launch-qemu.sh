@@ -1,5 +1,7 @@
 #!/bin/bash
 
+THIS_DIR=$(dirname "$(readlink -f "$0")")
+
 #
 # user changeable parameters
 #
@@ -15,7 +17,8 @@ CPU_MODEL="EPYC-v4"
 MONITOR_PATH=monitor
 QEMU_CONSOLE_LOG=`pwd`/stdout.log
 CERTS_PATH=
-
+USE_VIRTIO="1"
+BRIDGE=""
 
 SEV="0"
 SEV_ES="0"
@@ -23,7 +26,7 @@ SEV_SNP="0"
 ALLOW_DEBUG="0"
 USE_GDB="0"
 
-EXEC_PATH="./usr/local"
+EXEC_PATH="$THIS_DIR/usr/local"
 UEFI_PATH="$EXEC_PATH/share/qemu"
 
 usage() {
@@ -49,6 +52,8 @@ usage() {
 	echo " -monitor PATH      Path to QEMU monitor socket (default: $MONITOR_PATH)"
 	echo " -log PATH          Path to QEMU console log (default: $QEMU_CONSOLE_LOG)"
 	echo " -certs PATH        Path to SNP certificate blob for guest (default: none)"
+	echo " -bridge            Use the specified bridge device for networking"
+	echo " -novirtio          Do not use virtio devices"
 	exit 1
 }
 
@@ -56,7 +61,45 @@ add_opts() {
 	echo -n "$* " >> ${QEMU_CMDLINE}
 }
 
+stop_network() {
+	if [ "$GUEST_TAP_NAME" = "" ]; then
+		return
+	fi
+	run_cmd "ip tuntap del ${GUEST_TAP_NAME} mode tap"
+}
+
+setup_bridge_network() {
+	# Get last tap device on host (format: tap#{num})
+	# TAP_NUM="$(ip link show type tun | grep 'tap[0-9]\+' | sed -re 's|.*tap([0-9]+):.*|\1|' | sort -n | tail -1)"
+	TAP_NUM="$(ip link show type tun | grep -o 'tap[0-9]\+' | sed 's/tap//' | sort -n | tail -1)"
+
+	if [ "$TAP_NUM" = "" ]; then
+		TAP_NUM="0"
+	fi
+	TAP_NUM=$((TAP_NUM + 1))
+	GUEST_TAP_NAME="tap${TAP_NUM}"
+
+	[ -n "$USE_VIRTIO" ] && PREFIX="52:54:00" || PREFIX="02:16:1e"
+	SUFFIX="$(ip address show dev $BRIDGE | grep link/ether | awk '{print $2}' | awk -F : '{print $4 ":" $5}')"
+	GUEST_MAC_ADDR=$(printf "%s:%s:%02x" $PREFIX $SUFFIX $TAP_NUM)
+
+	echo "Starting network adapter '${GUEST_TAP_NAME}' MAC=$GUEST_MAC_ADDR"
+	run_cmd "ip tuntap add $GUEST_TAP_NAME mode tap user `whoami`"
+	run_cmd "ip link set $GUEST_TAP_NAME up"
+	run_cmd "ip link set $GUEST_TAP_NAME master $BRIDGE"
+
+	if [ -n "$USE_VIRTIO" ]; then
+		add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=$GUEST_TAP_NAME"
+		add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,disable-legacy=on,iommu_platform=true,romfile="
+	else
+		add_opts "-netdev tap,id=net0,ifname=$GUEST_TAP_NAME,script=no,downscript=no"
+		add_opts "-device e1000,mac=${GUEST_MAC_ADDR},netdev=net0,romfile="
+	fi
+}
+
 exit_from_int() {
+	stop_network
+
 	rm -rf ${QEMU_CMDLINE}
 	# restore the mapping
 	stty intr ^c
@@ -152,6 +195,11 @@ while [ -n "$1" ]; do
 		-certs) CERTS_PATH="$2"
 				shift
 				;;
+		-bridge)	BRIDGE=$2
+				shift
+				;;
+		-novirtio)  USE_VIRTIO=""
+				;;
 		*) 		usage
 				;;
 	esac
@@ -241,7 +289,7 @@ add_opts "-no-reboot"
 # The OVMF binary, including the non-volatile variable store, appears as a
 # "normal" qemu drive on the host side, and it is exposed to the guest as a
 # persistent flash device.
-add_opts "-drive if=pflash,format=raw,unit=0,file=${UEFI_CODE},readonly"
+add_opts "-drive if=pflash,format=raw,unit=0,file=${UEFI_CODE},readonly=on"
 add_opts "-drive if=pflash,format=raw,unit=1,file=${UEFI_VARS}"
 
 # add CDROM if specified
@@ -251,10 +299,10 @@ add_opts "-drive if=pflash,format=raw,unit=1,file=${UEFI_VARS}"
 # distros like Ubuntu 20.04 still only provide 4.1, so only enable
 # usermode network if specifically requested.
 if [ "$USE_DEFAULT_NETWORK" = "1" ]; then
-    #echo "guest port 22 is fwd to host 8000..."
-    #add_opts "-netdev user,id=vmnic,hostfwd=tcp::8000-:22 -device e1000,netdev=vmnic,romfile="
-    add_opts "-netdev user,id=vmnic"
-    add_opts " -device virtio-net-pci,disable-legacy=on,iommu_platform=true,netdev=vmnic,romfile="
+	#echo "guest port 22 is fwd to host 8000..."
+	#add_opts "-netdev user,id=vmnic,hostfwd=tcp::8000-:22 -device e1000,netdev=vmnic,romfile="
+	add_opts "-netdev user,id=vmnic"
+	add_opts " -device virtio-net-pci,disable-legacy=on,iommu_platform=true,netdev=vmnic,romfile="
 fi
 
 # If harddisk file is specified then add the HDD drive
@@ -321,6 +369,12 @@ fi
 
 # start monitor on pty and named socket 'monitor'
 add_opts "-monitor pty -monitor unix:${MONITOR_PATH},server,nowait"
+
+if [ -n "$BRIDGE" ]; then
+	setup_bridge_network
+else
+	add_opts "-netdev user,id=vmnic -device e1000,netdev=vmnic,romfile="
+fi
 
 # save the command line args into log file
 cat $QEMU_CMDLINE | tee ${QEMU_CONSOLE_LOG}
