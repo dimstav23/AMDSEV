@@ -23,5 +23,5 @@ QEMU_COMMIT="24503e2fb30209a4f0646f01d8877832843bb241"
 #   which will build the latest known-working QEMU/OVMF trees for older
 #   SNP hypervisor/host kernels.
 OVMF_GIT_URL="https://github.com/dimstav23/amd-ovmf.git"
-OVMF_BRANCH="dimstav23/ovmf_fix_snapshot_31_02_2025"
+OVMF_BRANCH="dimstav23/ovmf_fix_snapshot_31_01_2025"
 OVMF_COMMIT="affadd66af8eb823518096949d86261fd66fcee3"
