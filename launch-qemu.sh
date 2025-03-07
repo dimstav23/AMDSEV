@@ -86,7 +86,7 @@ setup_bridge_network() {
 	run_cmd "ip link set $GUEST_TAP_NAME master $BRIDGE"
 
 	if [ -n "$USE_VIRTIO" ]; then
-		add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=$GUEST_TAP_NAME"
+		add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=$GUEST_TAP_NAME,vhost=on"
 		add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,disable-legacy=on,iommu_platform=true,romfile="
 	else
 		add_opts "-netdev tap,id=net0,ifname=$GUEST_TAP_NAME,script=no,downscript=no"
