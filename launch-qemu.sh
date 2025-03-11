@@ -12,7 +12,7 @@ VNC=""
 CONSOLE="serial"
 USE_VIRTIO="1"
 USE_DEFAULT_NETWORK="0"
-CPU_MODEL="EPYC-v4"
+CPU_MODEL="host,+kvm_pv_unhalt,+kvm_pv_eoi"
 MONITOR_PATH=monitor
 QEMU_CONSOLE_LOG=`pwd`/stdout.log
 CERTS_PATH=
@@ -64,7 +64,7 @@ stop_network() {
 	if [ "$GUEST_TAP_NAME" = "" ]; then
 		return
 	fi
-	run_cmd "ip tuntap del ${GUEST_TAP_NAME} mode tap"
+	run_cmd "ip tuntap del ${GUEST_TAP_NAME} mode tap multi_queue"
 }
 
 setup_bridge_network() {
@@ -81,13 +81,13 @@ setup_bridge_network() {
 	GUEST_MAC_ADDR=$(printf "%s:%s:%02x" $PREFIX $SUFFIX $TAP_NUM)
 
 	echo "Starting network adapter '${GUEST_TAP_NAME}' MAC=$GUEST_MAC_ADDR"
-	run_cmd "ip tuntap add $GUEST_TAP_NAME mode tap user `whoami`"
+	run_cmd "ip tuntap add $GUEST_TAP_NAME mode tap user `whoami` multi_queue"
 	run_cmd "ip link set $GUEST_TAP_NAME up"
 	run_cmd "ip link set $GUEST_TAP_NAME master $BRIDGE"
 
 	if [ -n "$USE_VIRTIO" ]; then
-		add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=$GUEST_TAP_NAME,vhost=on"
-		add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,disable-legacy=on,iommu_platform=true,romfile="
+		add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=$GUEST_TAP_NAME,vhost=on,queues=${SMP},poll-us=10000,vnet_hdr=on"
+		add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,disable-modern=off,disable-legacy=on,iommu_platform=on,mq=on,vectors=$((2 * SMP + 1)),romfile="
 	else
 		add_opts "-netdev tap,id=net0,ifname=$GUEST_TAP_NAME,script=no,downscript=no"
 		add_opts "-device e1000,mac=${GUEST_MAC_ADDR},netdev=net0,romfile="
