@@ -10,16 +10,18 @@ MEM="2048"
 SMP="4"
 VNC=""
 CONSOLE="serial"
-USE_VIRTIO="1"
 USE_DEFAULT_NETWORK="0"
-CPU_MODEL="host,+kvm_pv_unhalt,+kvm_pv_eoi"
+CPU_MODEL="host"
 MONITOR_PATH=monitor
 QEMU_CONSOLE_LOG=`pwd`/stdout.log
 CERTS_PATH=
 
 # Additional networking parameters
-USE_VIRTIO="1"
+USE_VIRTIO="1" # enabled by default
+USE_VHOST="" # disabled by default
+USE_IOMMU="1" # enable iommu_platform by default
 BRIDGE=""
+GUEST_TAP_NAME="gdpr_tap"
 
 SEV=
 SEV_ES=
@@ -53,6 +55,8 @@ usage() {
 	echo " -certs PATH        Path to SNP certificate blob for guest (default: none)"
 	echo " -bridge            Use the specified bridge device for networking"
 	echo " -novirtio          Do not use virtio devices"
+  echo " -noiommu           Do not use iommu"
+  echo " -vhost             Use vhost"
 	exit 1
 }
 
@@ -64,34 +68,107 @@ stop_network() {
 	if [ "$GUEST_TAP_NAME" = "" ]; then
 		return
 	fi
+  run_cmd "ip link set ${GUEST_TAP_NAME} down"
 	run_cmd "ip tuntap del ${GUEST_TAP_NAME} mode tap multi_queue"
 }
 
 setup_bridge_network() {
-	# Get last tap device on host
-	TAP_NUM="$(ip link show type tun | grep 'tap[0-9]\+' | sed -re 's|.*tap([0-9]+):.*|\1|' | sort -n | tail -1)"
-	if [ "$TAP_NUM" = "" ]; then
-		TAP_NUM="0"
-	fi
-	TAP_NUM=$((TAP_NUM + 1))
-	GUEST_TAP_NAME="tap${TAP_NUM}"
+	# Use fixed TAP name instead of dynamic numbering
+  GUEST_TAP_NAME="gdpr_tap"
+  
+  # Clean up existing interface if it exists
+  if ip link show "$GUEST_TAP_NAME" &>/dev/null; then
+    echo "Removing existing TAP interface: $GUEST_TAP_NAME"
+    run_cmd "ip link set "$GUEST_TAP_NAME" down"
+    run_cmd "ip link set "$GUEST_TAP_NAME" nomaster"
+    run_cmd "ip route flush cache"
+    run_cmd "ip neigh flush dev "$GUEST_TAP_NAME""
+    run_cmd "ip tuntap del "$GUEST_TAP_NAME" mode tap multi_queue"
+  fi
 
-	[ -n "$USE_VIRTIO" ] && PREFIX="52:54:00" || PREFIX="02:16:1e"
-	SUFFIX="$(ip address show dev $BRIDGE | grep link/ether | awk '{print $2}' | awk -F : '{print $4 ":" $5}')"
-	GUEST_MAC_ADDR=$(printf "%s:%s:%02x" $PREFIX $SUFFIX $TAP_NUM)
+  # MAC address generation (keep your existing logic)
+  [ -n "$USE_VIRTIO" ] && PREFIX="52:54:00" || PREFIX="02:16:1e"
+  SUFFIX="$(ip address show dev $BRIDGE | grep link/ether | awk '{print $2}' | awk -F : '{print $4 ":" $5}')"
+  GUEST_MAC_ADDR=$(printf "%s:%s:01" $PREFIX $SUFFIX)  # Fixed :01 instead of TAP_NUM
 
-	echo "Starting network adapter '${GUEST_TAP_NAME}' MAC=$GUEST_MAC_ADDR"
-	run_cmd "ip tuntap add $GUEST_TAP_NAME mode tap user `whoami` multi_queue"
-	run_cmd "ip link set $GUEST_TAP_NAME up"
-	run_cmd "ip link set $GUEST_TAP_NAME master $BRIDGE"
+  echo "Starting network adapter '${GUEST_TAP_NAME}' MAC=$GUEST_MAC_ADDR"
+  
+  # Create and configure TAP
+  run_cmd "ip tuntap add $GUEST_TAP_NAME mode tap user $(whoami) multi_queue"
+  sleep 0.1 # let the interface stabilize
+  run_cmd "ip link set $GUEST_TAP_NAME up"
+  sleep 0.1 # let the interface come up
+  run_cmd "ip link set $GUEST_TAP_NAME master $BRIDGE"
 
 	if [ -n "$USE_VIRTIO" ]; then
-		add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=$GUEST_TAP_NAME,vhost=on,queues=${SMP},poll-us=10000,vnet_hdr=on"
-		add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,disable-modern=off,disable-legacy=on,iommu_platform=on,mq=on,vectors=$((2 * SMP + 1)),romfile="
+    # vhost=on only when USE_VHOST is defined, otherwise off
+    if [ -n "${USE_VHOST}" ]; then
+      VHOST_OPT="vhost=on"
+    else
+      VHOST_OPT="vhost=off"
+    fi
+    if [ -n "${USE_IOMMU}" ]; then
+      IOMMU_OPT="iommu_platform=on,disable-modern=off,disable-legacy=on,"
+    else
+      IOMMU_OPT=""
+    fi
+    add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=${GUEST_TAP_NAME},${VHOST_OPT},queues=${SMP},vnet_hdr=on"
+    add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,${IOMMU_OPT}mq=on,vectors=$((2 * SMP + 1)),romfile="
+		# add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=$GUEST_TAP_NAME,vhost=on,queues=${SMP},poll-us=10000,vnet_hdr=on"
+		# add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,disable-modern=off,disable-legacy=on,iommu_platform=on,mq=on,vectors=$((2 * SMP + 1)),romfile="
 	else
 		add_opts "-netdev tap,id=net0,ifname=$GUEST_TAP_NAME,script=no,downscript=no"
 		add_opts "-device e1000,mac=${GUEST_MAC_ADDR},netdev=net0,romfile="
 	fi
+}
+
+setup_bridge_network_new() {
+	# ------------------------------------------------------------------
+  # 1.  Always use a single, fixed TAP device:  gdpr_tap
+  #     – If it already exists, delete it first
+  # ------------------------------------------------------------------
+  if ip link show "${GUEST_TAP_NAME}" &>/dev/null; then
+    echo "Re-creating existing tap '${GUEST_TAP_NAME}'"
+    run_cmd "ip link set ${GUEST_TAP_NAME} down"
+    run_cmd "ip tuntap del ${GUEST_TAP_NAME} mode tap multi_queue"
+  fi
+
+  echo "Creating tap '${GUEST_TAP_NAME}'"
+  run_cmd "ip tuntap add $GUEST_TAP_NAME mode tap user `whoami` multi_queue"
+  run_cmd "ip link set $GUEST_TAP_NAME up"
+  run_cmd "ip link set $GUEST_TAP_NAME master $BRIDGE"
+  
+  # ------------------------------------------------------------------
+  #  Generate deterministic MAC address (unchanged logic)
+  # ------------------------------------------------------------------
+  [ -n "${USE_VIRTIO}" ] && PREFIX="52:54:00" || PREFIX="02:16:1e"
+  SUFFIX="$(ip address show dev ${BRIDGE} | awk '/link\/ether/{print $2}' | awk -F : '{print $4 ":" $5}')"
+  GUEST_MAC_ADDR=$(printf "%s:%s:%02x" "${PREFIX}" "${SUFFIX}" 1)   # fixed suffix “01”
+  echo "Network adapter '${GUEST_TAP_NAME}' MAC=${GUEST_MAC_ADDR}"
+
+  # ------------------------------------------------------------------
+  # 2.  Build QEMU netdev/device options
+  #     – If USE_VIRTIO is set we use virtio-net
+  #     – If USE_VHOST is **also** set, enable vhost acceleration
+  # ------------------------------------------------------------------
+  if [ -n "${USE_VIRTIO}" ]; then
+    # vhost=on only when USE_VHOST is defined, otherwise off
+    if [ -n "${USE_VHOST}" ]; then
+      VHOST_OPT="vhost=on"
+    else
+      VHOST_OPT="vhost=on"
+    fi
+    if [ -n "${USE_IOMMU}" ]; then
+      IOMMU_OPT="iommu_platform=on,disable-modern=off,disable-legacy=on"
+    else
+      IOMMU_OPT=""
+    fi
+    add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=${GUEST_TAP_NAME},${VHOST_OPT},queues=${SMP},vnet_hdr=on"
+    add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,${IOMMU_OPT},mq=on,vectors=$((2 * SMP + 1)),romfile="
+  else
+    add_opts "-netdev tap,id=net0,ifname=${GUEST_TAP_NAME},script=no,downscript=no"
+    add_opts "-device e1000,mac=${GUEST_MAC_ADDR},netdev=net0,romfile="
+  fi
 }
 
 exit_from_int() {
@@ -138,67 +215,31 @@ if [ `id -u` -ne 0 ]; then
 fi
 
 while [ -n "$1" ]; do
-	case "$1" in
-		-sev-snp)	SEV_SNP="1"
-				SEV_ES="1"
-				SEV="1"
-				;;
-		-sev-es)	SEV_ES="1"
-				SEV="1"
-				;;
-		-sev)		SEV="1"
-				;;
-		-hda) 		HDA="$2"
-				shift
-				;;
-		-mem)  		MEM="$2"
-				shift
-				;;
-		-smp)		SMP="$2"
-				shift
-				;;
-		-cpu)		CPU_MODEL="$2"
-				shift
-				;;
-		-bios)          UEFI_PATH="$2"
-				shift
-				;;
-		-allow-debug)   ALLOW_DEBUG="1"
-				;;
-		-kernel)	KERNEL_FILE=$2
-				shift
-				;;
-		-initrd)	INITRD_FILE=$2
-				shift
-				;;
-		-append)	APPEND=$2
-				shift
-				;;
-		-cdrom)		CDROM_FILE="$2"
-				shift
-				;;
-		-default-network)
-				USE_DEFAULT_NETWORK="1"
-				;;
-		-monitor)       MONITOR_PATH="$2"
-				shift
-				;;
-		-log)           QEMU_CONSOLE_LOG="$2"
-				shift
-				;;
-		-certs) CERTS_PATH="$2"
-				shift
-				;;
-		-bridge) BRIDGE="$2"
-				shift
-				;;
-		-novirtio) USE_VIRTIO=""
-				;;
-		*) 		usage
-				;;
-	esac
-
-	shift
+  case "$1" in
+    -sev-snp)         SEV_SNP="1"; SEV_ES="1"; SEV="1" ;;
+    -sev-es)          SEV_ES="1"; SEV="1" ;;
+    -sev)             SEV="1" ;;
+    -hda)             HDA="$2"; shift ;;
+    -mem)             MEM="$2"; shift ;;
+    -smp)             SMP="$2"; shift ;;
+    -cpu)             CPU_MODEL="$2"; shift ;;
+    -bios)            UEFI_PATH="$2"; shift ;;
+    -allow-debug)     ALLOW_DEBUG="1" ;;
+    -kernel)          KERNEL_FILE="$2"; shift ;;
+    -initrd)          INITRD_FILE="$2"; shift ;;
+    -append)          APPEND="$2"; shift ;;
+    -cdrom)           CDROM_FILE="$2"; shift ;;
+    -default-network) USE_DEFAULT_NETWORK="1" ;;
+    -monitor)         MONITOR_PATH="$2"; shift ;;
+    -log)             QEMU_CONSOLE_LOG="$2"; shift ;;
+    -certs)           CERTS_PATH="$2"; shift ;;
+    -bridge)          BRIDGE="$2"; shift ;;
+    -novirtio)        USE_VIRTIO="" ;;
+    -noiommu)         USE_IOMMU=""  ;;
+    -vhost)           USE_VHOST="1" ;;
+    *)                usage ;;
+  esac
+  shift
 done
 
 TMP=$QEMU_EXEC_PATH
