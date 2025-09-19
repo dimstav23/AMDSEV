@@ -57,6 +57,7 @@ usage() {
 	echo " -novirtio          Do not use virtio devices"
   echo " -noiommu           Do not use iommu"
   echo " -vhost             Use vhost"
+  echo " -nvme PATH         NVMe device path (default: /dev/nvme1n1)"
 	exit 1
 }
 
@@ -73,7 +74,10 @@ stop_network() {
 }
 
 setup_bridge_network() {
-	# Use fixed TAP name instead of dynamic numbering
+	# ------------------------------------------------------------------
+  # Always use a single, fixed TAP device:  gdpr_tap
+  #     – If it already exists, delete it first
+  # ------------------------------------------------------------------
   GUEST_TAP_NAME="gdpr_tap"
   
   # Clean up existing interface if it exists
@@ -86,10 +90,10 @@ setup_bridge_network() {
     run_cmd "ip tuntap del "$GUEST_TAP_NAME" mode tap multi_queue"
   fi
 
-  # MAC address generation (keep your existing logic)
+  # MAC address generation
   [ -n "$USE_VIRTIO" ] && PREFIX="52:54:00" || PREFIX="02:16:1e"
   SUFFIX="$(ip address show dev $BRIDGE | grep link/ether | awk '{print $2}' | awk -F : '{print $4 ":" $5}')"
-  GUEST_MAC_ADDR=$(printf "%s:%s:01" $PREFIX $SUFFIX)  # Fixed :01 instead of TAP_NUM
+  GUEST_MAC_ADDR=$(printf "%s:%s:01" $PREFIX $SUFFIX)  # Fixed :01 suffix
 
   echo "Starting network adapter '${GUEST_TAP_NAME}' MAC=$GUEST_MAC_ADDR"
   
@@ -100,6 +104,11 @@ setup_bridge_network() {
   sleep 0.1 # let the interface come up
   run_cmd "ip link set $GUEST_TAP_NAME master $BRIDGE"
 
+  # ------------------------------------------------------------------
+  # Build QEMU netdev/device options
+  #     – If USE_VIRTIO is set we use virtio-net
+  #     – If USE_VHOST is **also** set, enable vhost acceleration
+  # ------------------------------------------------------------------
 	if [ -n "$USE_VIRTIO" ]; then
     # vhost=on only when USE_VHOST is defined, otherwise off
     if [ -n "${USE_VHOST}" ]; then
@@ -122,53 +131,17 @@ setup_bridge_network() {
 	fi
 }
 
-setup_bridge_network_new() {
-	# ------------------------------------------------------------------
-  # 1.  Always use a single, fixed TAP device:  gdpr_tap
-  #     – If it already exists, delete it first
-  # ------------------------------------------------------------------
-  if ip link show "${GUEST_TAP_NAME}" &>/dev/null; then
-    echo "Re-creating existing tap '${GUEST_TAP_NAME}'"
-    run_cmd "ip link set ${GUEST_TAP_NAME} down"
-    run_cmd "ip tuntap del ${GUEST_TAP_NAME} mode tap multi_queue"
-  fi
-
-  echo "Creating tap '${GUEST_TAP_NAME}'"
-  run_cmd "ip tuntap add $GUEST_TAP_NAME mode tap user `whoami` multi_queue"
-  run_cmd "ip link set $GUEST_TAP_NAME up"
-  run_cmd "ip link set $GUEST_TAP_NAME master $BRIDGE"
-  
-  # ------------------------------------------------------------------
-  #  Generate deterministic MAC address (unchanged logic)
-  # ------------------------------------------------------------------
-  [ -n "${USE_VIRTIO}" ] && PREFIX="52:54:00" || PREFIX="02:16:1e"
-  SUFFIX="$(ip address show dev ${BRIDGE} | awk '/link\/ether/{print $2}' | awk -F : '{print $4 ":" $5}')"
-  GUEST_MAC_ADDR=$(printf "%s:%s:%02x" "${PREFIX}" "${SUFFIX}" 1)   # fixed suffix “01”
-  echo "Network adapter '${GUEST_TAP_NAME}' MAC=${GUEST_MAC_ADDR}"
-
-  # ------------------------------------------------------------------
-  # 2.  Build QEMU netdev/device options
-  #     – If USE_VIRTIO is set we use virtio-net
-  #     – If USE_VHOST is **also** set, enable vhost acceleration
-  # ------------------------------------------------------------------
-  if [ -n "${USE_VIRTIO}" ]; then
-    # vhost=on only when USE_VHOST is defined, otherwise off
-    if [ -n "${USE_VHOST}" ]; then
-      VHOST_OPT="vhost=on"
-    else
-      VHOST_OPT="vhost=on"
-    fi
+# Storage configuration
+setup_storage() {
+    local nvme_device="$1"
+    
+    echo "Using virtio-blk for storage device $nvme_device"
+    add_opts "-drive file=$nvme_device,if=none,id=nvme0,format=raw,cache=none,aio=native,detect-zeroes=off"
     if [ -n "${USE_IOMMU}" ]; then
-      IOMMU_OPT="iommu_platform=on,disable-modern=off,disable-legacy=on"
+        add_opts "-device virtio-blk-pci,drive=nvme0,disable-legacy=on,disable-modern=off,iommu_platform=on"
     else
-      IOMMU_OPT=""
+        add_opts "-device virtio-blk-pci,drive=nvme0"
     fi
-    add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=${GUEST_TAP_NAME},${VHOST_OPT},queues=${SMP},vnet_hdr=on"
-    add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,${IOMMU_OPT},mq=on,vectors=$((2 * SMP + 1)),romfile="
-  else
-    add_opts "-netdev tap,id=net0,ifname=${GUEST_TAP_NAME},script=no,downscript=no"
-    add_opts "-device e1000,mac=${GUEST_MAC_ADDR},netdev=net0,romfile="
-  fi
 }
 
 exit_from_int() {
@@ -237,6 +210,7 @@ while [ -n "$1" ]; do
     -novirtio)        USE_VIRTIO="" ;;
     -noiommu)         USE_IOMMU=""  ;;
     -vhost)           USE_VHOST="1" ;;
+    -nvme)            NVME_DEVICE="$2"; shift ;;
     *)                usage ;;
   esac
   shift
@@ -420,6 +394,10 @@ if [ -n "$BRIDGE" ]; then
 	setup_bridge_network
 else
 	add_opts "-netdev user,id=vmnic -device e1000,netdev=vmnic,romfile="
+fi
+
+if [ -n "$NVME_DEVICE" ]; then
+	setup_storage "$NVME_DEVICE"
 fi
 
 # save the command line args into log file
